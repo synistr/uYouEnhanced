@@ -105,25 +105,49 @@
 %hook MDXSessionImpl
 - (void)adPlaying:(id)ad {}
 %end
+// Shorts ads: video ads have videoType 3, non-video ads (e.g. product cards) carry ads custom data - @PoomSmart (YouTube-X)
+static BOOL isAdsReelContentModel(YTReelContentModel *model) {
+    if ([model respondsToSelector:@selector(videoType)])
+        return ((YTReelModel *)model).videoType == 3;
+    if ([model isKindOfClass:%c(YTReelNonVideoContentModel)]) {
+        @try {
+            id customData = [[(id)model valueForKey:@"renderer"] valueForKey:@"customData"];
+            return [[customData description] containsString:@"YTIReelNonVideoAdsCustomData_reelNonVideoAdsCustomData"];
+        } @catch (NSException *e) {}
+    }
+    return NO;
+}
+static void removeAdsReels(NSMutableOrderedSet <YTReelContentModel *> *reels) {
+    if (![reels isKindOfClass:[NSMutableOrderedSet class]]) return;
+    [reels removeObjectsAtIndexes:[reels indexesOfObjectsPassingTest:^BOOL(YTReelContentModel *obj, NSUInteger idx, BOOL *stop) {
+        return isAdsReelContentModel(obj);
+    }]];
+}
 %hook YTReelDataSource
-- (YTReelModel *)makeContentModelForEntry:(id)entry {
-    YTReelModel *model = %orig;
-    if ([model respondsToSelector:@selector(videoType)] && model.videoType == 3)
-        return nil;
-    return model;
+- (YTReelContentModel *)makeContentModelForEntry:(id)entry {
+    YTReelContentModel *model = %orig;
+    return isAdsReelContentModel(model) ? nil : model;
+}
+// YouTube 21.x
+- (void)setReels:(NSMutableOrderedSet <YTReelContentModel *> *)reels {
+    removeAdsReels(reels);
+    %orig;
+}
+%end
+// YouTube 21.x builds Shorts models in a class method
+%hook YTReelContentModel
++ (YTReelContentModel *)makeContentModelForEntry:(id)entry {
+    YTReelContentModel *model = %orig;
+    return isAdsReelContentModel(model) ? nil : model;
 }
 %end
 %hook YTReelInfinitePlaybackDataSource
-- (YTReelModel *)makeContentModelForEntry:(id)entry {
-    YTReelModel *model = %orig;
-    if ([model respondsToSelector:@selector(videoType)] && model.videoType == 3)
-        return nil;
-    return model;
+- (YTReelContentModel *)makeContentModelForEntry:(id)entry {
+    YTReelContentModel *model = %orig;
+    return isAdsReelContentModel(model) ? nil : model;
 }
-- (void)setReels:(NSMutableOrderedSet <YTReelModel *> *)reels {
-    [reels removeObjectsAtIndexes:[reels indexesOfObjectsPassingTest:^BOOL(YTReelModel *obj, NSUInteger idx, BOOL *stop) {
-        return [obj respondsToSelector:@selector(videoType)] ? obj.videoType == 3 : NO;
-    }]];
+- (void)setReels:(NSMutableOrderedSet <YTReelContentModel *> *)reels {
+    removeAdsReels(reels);
     %orig;
 }
 %end
@@ -226,6 +250,18 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
     [newArray removeObjectsAtIndexes:removeIndexes];
     return newArray;
 }
+// Like filteredArray, but also unwraps YTISectionListSupportedRenderers, as passed to the insert methods
+static NSArray *filteredSections(NSArray *sections) {
+    if (![sections isKindOfClass:[NSArray class]]) return sections;
+    NSMutableArray *kept = [NSMutableArray array];
+    for (id renderer in sections) {
+        id section = renderer;
+        if ([renderer isKindOfClass:%c(YTISectionListSupportedRenderers)] && ((YTISectionListSupportedRenderers *)renderer).itemSectionRenderer)
+            section = ((YTISectionListSupportedRenderers *)renderer).itemSectionRenderer;
+        if (filteredArray(@[section]).count) [kept addObject:renderer];
+    }
+    return kept;
+}
 %hook _ASDisplayView
 - (void)didMoveToWindow {
     %orig;
@@ -241,6 +277,48 @@ static NSMutableArray <YTIItemSectionRenderer *> *filteredArray(NSArray <YTIItem
 }
 - (void)addSectionsFromArray:(NSArray <YTIItemSectionRenderer *> *)array {
     %orig(filteredArray(array));
+}
+// YouTube 21.x also inserts and replaces sections after the feed has loaded (e.g. home feed ad slots)
+- (BOOL)insertSections:(NSArray *)sections byPosition:(int)position error:(id *)error {
+    NSArray *kept = filteredSections(sections);
+    if (sections.count && !kept.count) return YES;
+    return %orig(kept, position, error);
+}
+- (BOOL)insertSections:(NSArray *)sections byRelativePositionInSectionList:(id)list error:(id *)error {
+    NSArray *kept = filteredSections(sections);
+    if (sections.count && !kept.count) return YES;
+    return %orig(kept, list, error);
+}
+- (void)insertBelowVisibleSection:(id)section {
+    if (section && !filteredSections(@[section]).count) return;
+    %orig;
+}
+- (void)replaceSectionController:(id)controller withItemSectionRenderer:(id)renderer {
+    if (renderer && !filteredSections(@[renderer]).count) return;
+    %orig;
+}
+%end
+// Catch-all for ad elements arriving through any other path - @dayanch96 (YTLite)
+%hook YTIElementRenderer
+- (NSData *)elementData {
+    if (self.hasCompatibilityOptions && self.compatibilityOptions.hasAdLoggingData) return nil;
+    return %orig;
+}
+%end
+%hook YTSectionListViewController
+- (void)loadWithModel:(YTISectionListRenderer *)model {
+    if ([model respondsToSelector:@selector(contentsArray)]) {
+        NSMutableArray *contentsArray = model.contentsArray;
+        [contentsArray removeObjectsAtIndexes:[contentsArray indexesOfObjectsPassingTest:^BOOL(YTISectionListSupportedRenderers *renderers, NSUInteger idx, BOOL *stop) {
+            id firstObject = renderers.itemSectionRenderer.contentsArray.firstObject;
+            @try {
+                for (NSString *key in @[@"hasPromotedVideoRenderer", @"hasCompactPromotedVideoRenderer", @"hasPromotedVideoInlineMutedRenderer"])
+                    if ([[firstObject valueForKey:key] boolValue]) return YES;
+            } @catch (NSException *e) {}
+            return NO;
+        }]];
+    }
+    %orig;
 }
 %end
 %end
